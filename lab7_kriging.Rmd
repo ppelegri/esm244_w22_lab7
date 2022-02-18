@@ -1,0 +1,121 @@
+---
+title: 'Lab 7: kriging'
+author: "Patrick Pelegri-O'Day"
+date: "2/17/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(here)
+library(sf) # replacement for old R vector package 
+library(tmap)
+library(gstat)
+library(stars) # replacement for raster package. not as sophisticated yet
+```
+
+
+### Read in CA map and groundwater depth data
+
+```{r}
+ca_counties_sf <- read_sf(here('data/ca_counties'), 
+                          layer = 'CA_Counties_TIGER2016') %>% 
+  janitor::clean_names() %>% 
+  select(name)
+
+### check projection
+st_crs(ca_counties_sf)
+
+### read in groundwater depth data
+ca_dgw_sf <- read_sf(here('data/ca_dgw',
+                          'F2013_DBGS_Points_20150720_093252.gpkg')) %>% 
+  janitor::clean_names()
+
+st_crs(ca_dgw_sf) # check coordinate reference system
+
+# the coordinate reference systems are different, so we define a new sf that defines the coordinate system of that sf as the coordinate system of ca_counties_sf
+ca_dgw_sf <- st_transform(ca_dgw_sf, st_crs(ca_counties_sf))
+
+ggplot() + 
+  geom_sf(data = ca_counties_sf) +
+  geom_sf(data = ca_dgw_sf, aes(color = dgbs))
+```
+
+```{r}
+tmap_mode(mode = 'view')
+
+tm_shape(ca_dgw_sf) + 
+  tm_dots('dgbs', palette = 'Blues')
+# tmaptools::palette_explorer() ### need shinyjs package
+```
+
+Clip to San Joaquin County
+
+```{r}
+sj_county_sf <- ca_counties_sf %>% 
+  filter(name == 'San Joaquin')
+
+### now keep observations for groundwater depth in that county:
+sj_depth_sf <- ca_dgw_sf %>% 
+  st_intersection(sj_county_sf)
+
+ggplot() + 
+    geom_sf(data = sj_county_sf) +
+  geom_sf(data = sj_depth_sf, aes(color = dgbs)) +
+  theme_void() + 
+  scale_color_viridis_c()
+```
+
+### Check for duplicate locations
+
+```{r}
+well_duplicates <- sj_depth_sf %>% 
+  janitor::get_dupes(latitude, longitude)
+
+sj_depth_sf <- sj_depth_sf %>% 
+  filter(!local_well %in% well_duplicates$local_well)
+```
+
+### Create a variogram to figure out what the appropriate distance for kriging is
+```{r}
+sj_dwg_vgm <- gstat::variogram(dgbs ~ 1, data = sj_depth_sf) # we're doing ordinary kriging. Use this function to calculate an intercept for across the county...kinda spaced out for this explanation
+
+plot(sj_dwg_vgm)
+```
+
+```{r}
+### create the variogram model by fitting a line to the points calculated in the plot above
+
+sj_dwg_vgm_fit <- fit.variogram(sj_dwg_vgm, 
+                                model = vgm(model = 'Gau',
+                                            nugget = 20,
+                                            sill = 3000,
+                                            range = 30000))
+
+plot(sj_dwg_vgm, sj_dwg_vgm_fit)
+attr(sj_dwg_vgm_fit, 'SSErr') # compare models - compare different fits
+```
+
+## Spatial kriging
+
+```{r}
+sj_grid <- st_bbox(sj_county_sf) %>% 
+  stars::st_as_stars(dx = 500, dy = 500) %>% # not entirely sure what this did - i think defining resolution
+  st_set_crs(st_crs(sj_county_sf)) %>% 
+  st_crop(sj_county_sf) # crop sj_county_sf to only include points inside the polygon
+
+plot(sj_grid) # plot SJ county as a bunch of NAs
+
+### perform ordinary kriging
+sj_dwg_krige <- krige(dgbs ~ 1, sj_depth_sf, sj_grid,
+                      model = sj_dwg_vgm_fit)
+
+plot(sj_dwg_krige)
+
+krige_df <- as.data.frame(sj_dwg_krige) %>% 
+  st_as_sf(coords = c('x', 'y')) %>% # I got lost here, not sure what the st_as_sf is doing
+  drop_na(var1.pred)
+```
+
